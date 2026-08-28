@@ -1,20 +1,10 @@
-from typing import Dict, List
+from typing import List
 
-from fastapi import (
-    APIRouter,
-    HTTPException,
-)
-
-from pydantic import (
-    BaseModel,
-    Field,
-)
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from ai_engine.rag.search import search_evidence
-
-from backend.services.ai_service import (
-    AIEngineService,
-)
+from backend.services.ai_service import AIEngineService
 
 
 router = APIRouter(
@@ -22,23 +12,19 @@ router = APIRouter(
     tags=["AI Investigator"],
 )
 
-
 ai_service = AIEngineService()
 
 
 # =========================================================
-# MODELS
+# REQUEST MODELS
 # =========================================================
 
 class ChatMessage(BaseModel):
-
     role: str
-
     content: str
 
 
 class ChatRequest(BaseModel):
-
     question: str = Field(
         ...,
         min_length=1,
@@ -49,13 +35,10 @@ class ChatRequest(BaseModel):
         gt=0,
     )
 
-    conversation: List[
-        ChatMessage
-    ] = []
+    conversation: List[ChatMessage] = []
 
 
 class SearchRequest(BaseModel):
-
     query: str = Field(
         ...,
         min_length=1,
@@ -74,7 +57,7 @@ class SearchRequest(BaseModel):
 
 
 # =========================================================
-# HEALTH
+# AI HEALTH
 # =========================================================
 
 @router.get("/health")
@@ -82,26 +65,21 @@ def ai_health():
 
     return {
         "success": True,
-        "ai_available":
-            ai_service.is_available(),
-        "model":
-            ai_service.model,
+        "ai_available": ai_service.is_available(),
+        "model": ai_service.model,
     }
 
 
 # =========================================================
-# CHATGPT-STYLE INVESTIGATOR
+# CHATGPT-STYLE AI INVESTIGATOR
 # =========================================================
 
 @router.post("/chat")
-def ai_chat(
-    request: ChatRequest,
-):
+def ai_chat(request: ChatRequest):
 
     question = request.question.strip()
 
     if not question:
-
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty.",
@@ -110,7 +88,7 @@ def ai_chat(
     try:
 
         # -------------------------------------------------
-        # Retrieve relevant evidence
+        # SEARCH INVESTIGATION EVIDENCE
         # -------------------------------------------------
 
         try:
@@ -123,16 +101,13 @@ def ai_chat(
 
         except TypeError:
 
-            # Compatibility with older
-            # search_evidence implementation
-
             search_results = search_evidence(
                 question,
                 request.investigation_id,
             )
 
         # -------------------------------------------------
-        # Build evidence context
+        # BUILD EVIDENCE CONTEXT
         # -------------------------------------------------
 
         evidence_parts = []
@@ -156,9 +131,7 @@ def ai_chat(
                 or ""
             )
 
-            score = result.get(
-                "score"
-            )
+            score = result.get("score")
 
             if not text:
                 continue
@@ -190,48 +163,48 @@ Content:
             )
 
         # -------------------------------------------------
-        # Conversation
+        # CONVERSATION HISTORY
         # -------------------------------------------------
 
         conversation = []
 
-        for message in (
-            request.conversation[-12:]
-        ):
+        for message in request.conversation[-12:]:
+
+            # Only allow normal ChatGPT roles
+            role = message.role
+
+            if role not in {
+                "user",
+                "assistant",
+                "system",
+            }:
+                role = "user"
 
             conversation.append(
                 {
-                    "role": message.role,
+                    "role": role,
                     "content": message.content,
                 }
             )
 
         # -------------------------------------------------
-        # AI
+        # SEND TO AI
         # -------------------------------------------------
 
         result = ai_service.chat(
             question=question,
-            evidence_context=
-                evidence_context,
-            conversation=
-                conversation,
+            evidence_context=evidence_context,
+            conversation=conversation,
         )
 
         return {
             "success": True,
-            "answer":
-                result["answer"],
-            "model":
-                result["model"],
-            "investigation_id":
-                request.investigation_id,
-            "question":
-                question,
-            "evidence_count":
-                len(evidence_parts),
-            "evidence":
-                search_results or [],
+            "answer": result["answer"],
+            "model": result["model"],
+            "investigation_id": request.investigation_id,
+            "question": question,
+            "evidence_count": len(evidence_parts),
+            "evidence": search_results or [],
         }
 
     except Exception as error:
@@ -248,13 +221,11 @@ Content:
 
 
 # =========================================================
-# SEMANTIC SEARCH
+# SEMANTIC EVIDENCE SEARCH
 # =========================================================
 
 @router.post("/search")
-def search_ai(
-    request: SearchRequest,
-):
+def search_ai(request: SearchRequest):
 
     query = request.query.strip()
 
@@ -282,19 +253,14 @@ def search_ai(
                 request.investigation_id,
             )
 
-            results = results[
-                :request.top_k
-            ]
+            results = results[:request.top_k]
 
         return {
             "success": True,
             "query": query,
-            "investigation_id":
-                request.investigation_id,
-            "results_count":
-                len(results or []),
-            "results":
-                results or [],
+            "investigation_id": request.investigation_id,
+            "results_count": len(results or []),
+            "results": results or [],
         }
 
     except Exception as error:
@@ -308,3 +274,76 @@ def search_ai(
             status_code=500,
             detail=f"AI search failed: {error}",
         )
+
+
+# =========================================================
+# TIMELINE EXTRACTION
+# =========================================================
+
+class InvestigationAnalysisRequest(BaseModel):
+    investigation_id: int
+
+
+@router.post("/timeline")
+def get_investigation_timeline(request: InvestigationAnalysisRequest):
+    from backend.database import SessionLocal
+    from backend.models import Evidence
+
+    db = SessionLocal()
+    try:
+        evidence_items = (
+            db.query(Evidence)
+            .filter(Evidence.investigation_id == request.investigation_id)
+            .all()
+        )
+        combined_text = "\n\n".join(
+            [
+                f"--- EVIDENCE: {e.filename} ---\n{e.extracted_text or ''}"
+                for e in evidence_items
+                if e.extracted_text
+            ]
+        )
+
+        timeline = ai_service.extract_timeline(combined_text)
+        return {
+            "success": True,
+            "investigation_id": request.investigation_id,
+            "events_count": len(timeline),
+            "events": timeline,
+        }
+    finally:
+        db.close()
+
+
+# =========================================================
+# ENTITY EXTRACTION
+# =========================================================
+
+@router.post("/entities")
+def get_investigation_entities(request: InvestigationAnalysisRequest):
+    from backend.database import SessionLocal
+    from backend.models import Evidence
+
+    db = SessionLocal()
+    try:
+        evidence_items = (
+            db.query(Evidence)
+            .filter(Evidence.investigation_id == request.investigation_id)
+            .all()
+        )
+        combined_text = "\n\n".join(
+            [
+                f"--- EVIDENCE: {e.filename} ---\n{e.extracted_text or ''}"
+                for e in evidence_items
+                if e.extracted_text
+            ]
+        )
+
+        entities = ai_service.extract_entities(combined_text)
+        return {
+            "success": True,
+            "investigation_id": request.investigation_id,
+            "entities": entities,
+        }
+    finally:
+        db.close()

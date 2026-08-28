@@ -1,700 +1,283 @@
-from pathlib import Path
 import hashlib
-import shutil
-from datetime import datetime
+import os
+from pathlib import Path
+from typing import List
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
-from backend.models import Investigation, Evidence
-
+from backend.models import Evidence, Investigation
+from backend.schemas import EvidenceResponse
+from backend.services.text_extractor import extract_text
 
 router = APIRouter(
     prefix="/investigations",
     tags=["Evidence"],
 )
 
-
-# ---------------------------------------------------------
-# STORAGE
-# ---------------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parents[2]
 
-STORAGE_DIR = (
-    BASE_DIR
-    / "storage"
-    / "evidence"
-)
-
+STORAGE_DIR = BASE_DIR / "storage" / "evidence"
 STORAGE_DIR.mkdir(
     parents=True,
-    exist_ok=True
+    exist_ok=True,
 )
 
+ALLOWED_EXTENSIONS = {
+    ".txt",
+    ".pdf",
+    ".docx",
+    ".md",
+    ".csv",
+    ".log",
+    ".json",
+}
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-
-def calculate_hash(file_path: Path) -> str:
-
-    sha256 = hashlib.sha256()
-
-    with open(file_path, "rb") as file:
-
-        while True:
-
-            chunk = file.read(1024 * 1024)
-
-            if not chunk:
-                break
-
-            sha256.update(chunk)
-
-    return sha256.hexdigest()
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
 
-def extract_text(file_path: Path) -> str:
-
-    extension = file_path.suffix.lower()
-
-    # TXT / CSV / LOG / JSON / XML / MD
-    if extension in [
-        ".txt",
-        ".csv",
-        ".log",
-        ".json",
-        ".xml",
-        ".md",
-        ".html",
-        ".htm",
-    ]:
-
-        try:
-
-            return file_path.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
-        except Exception:
-
-            return ""
+def calculate_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-    # PDF
-    if extension == ".pdf":
+def safe_filename(filename: str) -> str:
+    filename = os.path.basename(filename)
 
-        try:
+    filename = filename.replace(
+        "\x00",
+        "",
+    )
 
-            import pypdf
-
-            text = []
-
-            reader = pypdf.PdfReader(
-                str(file_path)
-            )
-
-            for page in reader.pages:
-
-                page_text = page.extract_text()
-
-                if page_text:
-                    text.append(page_text)
-
-            return "\n".join(text)
-
-        except Exception as error:
-
-            print(
-                "PDF extraction failed:",
-                error
-            )
-
-            return ""
+    return filename[:255]
 
 
-    # DOCX
-    if extension == ".docx":
-
-        try:
-
-            from docx import Document
-
-            document = Document(
-                str(file_path)
-            )
-
-            return "\n".join(
-                paragraph.text
-                for paragraph in document.paragraphs
-            )
-
-        except Exception as error:
-
-            print(
-                "DOCX extraction failed:",
-                error
-            )
-
-            return ""
-
-
-    return ""
-
-
-# ---------------------------------------------------------
-# LIST EVIDENCE
-# ---------------------------------------------------------
-
-@router.get("/{investigation_id}/evidence")
+@router.get(
+    "/{investigation_id}/evidence",
+    response_model=List[EvidenceResponse],
+)
 def get_evidence(
     investigation_id: int,
     db: Session = Depends(get_db),
 ):
-
     investigation = (
         db.query(Investigation)
-        .filter(
-            Investigation.id == investigation_id
-        )
+        .filter(Investigation.id == investigation_id)
         .first()
     )
 
     if not investigation:
-
         raise HTTPException(
             status_code=404,
-            detail="Investigation not found"
+            detail="Investigation not found.",
         )
 
-
-    evidence_items = (
+    return (
         db.query(Evidence)
         .filter(
-            Evidence.investigation_id
-            == investigation_id
+            Evidence.investigation_id == investigation_id
         )
-        .order_by(
-            Evidence.uploaded_at.desc()
-        )
+        .order_by(Evidence.uploaded_at.desc())
         .all()
     )
 
 
-    result = []
-
-    for item in evidence_items:
-
-        result.append({
-
-            "id": item.id,
-
-            "investigation_id":
-                item.investigation_id,
-
-            "filename":
-                item.filename,
-
-            "file_type":
-                item.file_type,
-
-            "file_size":
-                item.file_size or 0,
-
-            "file_hash":
-                item.file_hash,
-
-            "storage_path":
-                item.storage_path,
-
-            "file_path":
-                item.file_path,
-
-            "processing_status":
-                item.processing_status
-                or "pending",
-
-            "extracted_text":
-                item.extracted_text,
-
-            "ai_analysis_result":
-                item.ai_analysis_result,
-
-            "uploaded_at":
-                item.uploaded_at.isoformat()
-                if item.uploaded_at
-                else None,
-
-        })
-
-
-    return result
-
-
-# ---------------------------------------------------------
-# UPLOAD EVIDENCE
-# ---------------------------------------------------------
-
-@router.post("/{investigation_id}/evidence")
+@router.post(
+    "/{investigation_id}/evidence",
+    response_model=EvidenceResponse,
+)
 async def upload_evidence(
     investigation_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-
-    # -----------------------------------------------------
-    # CHECK INVESTIGATION
-    # -----------------------------------------------------
-
     investigation = (
         db.query(Investigation)
-        .filter(
-            Investigation.id == investigation_id
-        )
+        .filter(Investigation.id == investigation_id)
         .first()
     )
 
     if not investigation:
-
         raise HTTPException(
             status_code=404,
-            detail="Investigation not found"
+            detail="Investigation not found.",
         )
-
-
-    # -----------------------------------------------------
-    # CHECK FILE
-    # -----------------------------------------------------
 
     if not file.filename:
-
         raise HTTPException(
             status_code=400,
-            detail="No file selected"
+            detail="No filename provided.",
         )
 
+    filename = safe_filename(file.filename)
 
-    original_filename = Path(
-        file.filename
-    ).name
+    extension = Path(filename).suffix.lower()
 
-    extension = Path(
-        original_filename
-    ).suffix.lower()
-
-
-    # -----------------------------------------------------
-    # TEMP FILE
-    # -----------------------------------------------------
-
-    temp_name = (
-        f"temp_"
-        f"{datetime.now().timestamp()}"
-        f"_{original_filename}"
-    )
-
-    temp_path = STORAGE_DIR / temp_name
-
-
-    try:
-
-        with open(
-            temp_path,
-            "wb"
-        ) as buffer:
-
-            shutil.copyfileobj(
-                file.file,
-                buffer
-            )
-
-
-        # -------------------------------------------------
-        # FILE SIZE
-        # -------------------------------------------------
-
-        file_size = temp_path.stat().st_size
-
-
-        # -------------------------------------------------
-        # HASH
-        # -------------------------------------------------
-
-        file_hash = calculate_hash(
-            temp_path
-        )
-
-
-        # -------------------------------------------------
-        # DUPLICATE CHECK
-        # -------------------------------------------------
-
-        existing = (
-            db.query(Evidence)
-            .filter(
-                Evidence.investigation_id
-                == investigation_id,
-
-                Evidence.file_hash
-                == file_hash
-            )
-            .first()
-        )
-
-
-        if existing:
-
-            # Remove temporary file
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-
-
-            # Instead of returning 409,
-            # return existing evidence.
-            #
-            # This prevents the frontend
-            # from showing "Upload failed"
-            # when the same file is selected again.
-
-            return {
-
-                "success": True,
-
-                "duplicate": True,
-
-                "message":
-                    "This evidence file is already uploaded.",
-
-                "evidence": {
-
-                    "id":
-                        existing.id,
-
-                    "investigation_id":
-                        existing.investigation_id,
-
-                    "filename":
-                        existing.filename,
-
-                    "file_type":
-                        existing.file_type,
-
-                    "file_size":
-                        existing.file_size or 0,
-
-                    "file_hash":
-                        existing.file_hash,
-
-                    "processing_status":
-                        existing.processing_status
-                        or "completed",
-
-                    "extracted_text":
-                        existing.extracted_text,
-
-                    "uploaded_at":
-                        existing.uploaded_at.isoformat()
-                        if existing.uploaded_at
-                        else None,
-                }
-            }
-
-
-        # -------------------------------------------------
-        # FINAL STORAGE PATH
-        # -------------------------------------------------
-
-        safe_filename = (
-            f"{file_hash}_"
-            f"{original_filename}"
-        )
-
-        final_path = (
-            STORAGE_DIR
-            / safe_filename
-        )
-
-
-        # Move temp file
-        shutil.move(
-            str(temp_path),
-            str(final_path)
-        )
-
-
-        # -------------------------------------------------
-        # TEXT EXTRACTION
-        # -------------------------------------------------
-
-        extracted_text = ""
-
-        try:
-
-            extracted_text = extract_text(
-                final_path
-            )
-
-        except Exception as error:
-
-            print(
-                "Text extraction failed:",
-                error
-            )
-
-            extracted_text = ""
-
-
-        # -------------------------------------------------
-        # CREATE DATABASE RECORD
-        # -------------------------------------------------
-
-        evidence_item = Evidence(
-
-            investigation_id=
-                investigation_id,
-
-            filename=
-                original_filename,
-
-            file_type=
-                extension
-                if extension
-                else file.content_type,
-
-            file_size=
-                file_size,
-
-            file_hash=
-                file_hash,
-
-            storage_path=
-                str(final_path),
-
-            file_path=
-                str(final_path),
-
-            processing_status=
-                "completed",
-
-            extracted_text=
-                extracted_text,
-
-            ai_analysis_result=
-                None,
-
-            uploaded_at=
-                datetime.utcnow(),
-
-        )
-
-
-        db.add(
-            evidence_item
-        )
-
-        db.commit()
-
-        db.refresh(
-            evidence_item
-        )
-
-
-        # -------------------------------------------------
-        # SUCCESS
-        # -------------------------------------------------
-
-        return {
-
-            "success": True,
-
-            "duplicate": False,
-
-            "message":
-                "Evidence uploaded successfully.",
-
-            "evidence": {
-
-                "id":
-                    evidence_item.id,
-
-                "investigation_id":
-                    evidence_item.investigation_id,
-
-                "filename":
-                    evidence_item.filename,
-
-                "file_type":
-                    evidence_item.file_type,
-
-                "file_size":
-                    evidence_item.file_size,
-
-                "file_hash":
-                    evidence_item.file_hash,
-
-                "storage_path":
-                    evidence_item.storage_path,
-
-                "processing_status":
-                    evidence_item.processing_status,
-
-                "extracted_text":
-                    evidence_item.extracted_text,
-
-                "uploaded_at":
-                    evidence_item.uploaded_at.isoformat()
-                    if evidence_item.uploaded_at
-                    else None,
-
-            }
-        }
-
-
-    except HTTPException:
-
-        raise
-
-
-    except Exception as error:
-
-        db.rollback()
-
-        print(
-            "UPLOAD ERROR:",
-            repr(error)
-        )
-
-        # Remove temporary file
-        try:
-
-            if temp_path.exists():
-                temp_path.unlink()
-
-        except Exception:
-            pass
-
-
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
-            status_code=500,
-            detail=f"Evidence upload failed: {error}"
+            status_code=400,
+            detail=(
+                f"Unsupported file type: {extension}. "
+                f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
         )
 
+    content = await file.read()
 
-# ---------------------------------------------------------
-# DOWNLOAD
-# ---------------------------------------------------------
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
+        )
 
-@router.get("/evidence/{evidence_id}/download")
-def download_evidence(
-    evidence_id: int,
-    db: Session = Depends(get_db),
-):
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="File is too large. Maximum size is 25 MB.",
+        )
 
-    item = (
+    file_hash = calculate_hash(content)
+
+    # Duplicate check inside the same investigation
+    existing = (
         db.query(Evidence)
         .filter(
-            Evidence.id == evidence_id
+            Evidence.investigation_id == investigation_id,
+            Evidence.file_hash == file_hash,
         )
         .first()
     )
 
-    if not item:
-
+    if existing:
         raise HTTPException(
-            status_code=404,
-            detail="Evidence not found"
+            status_code=409,
+            detail="This file has already been uploaded to this investigation.",
         )
 
+    stored_name = f"{file_hash}_{filename}"
 
-    path = Path(
-        item.storage_path
-        or item.file_path
-        or ""
-    )
+    stored_path = STORAGE_DIR / stored_name
 
-
-    if not path.exists():
-
+    try:
+        stored_path.write_bytes(content)
+    except Exception as exc:
         raise HTTPException(
-            status_code=404,
-            detail="File not found on server"
+            status_code=500,
+            detail=f"Could not save file: {exc}",
         )
 
-
-    return FileResponse(
-        path=str(path),
-        filename=item.filename,
-        media_type="application/octet-stream"
+    evidence = Evidence(
+        investigation_id=investigation_id,
+        filename=filename,
+        file_type=extension,
+        file_size=len(content),
+        file_hash=file_hash,
+        storage_path=str(stored_path),
+        processing_status="processing",
+        extracted_text=None,
+        ai_analysis_result=None,
     )
 
+    db.add(evidence)
+    db.commit()
+    db.refresh(evidence)
 
-# ---------------------------------------------------------
-# DELETE EVIDENCE
-# ---------------------------------------------------------
+    # Extract text and index in vector store
+    try:
+        extracted = extract_text(
+            str(stored_path)
+        )
 
-@router.delete("/evidence/{evidence_id}")
+        evidence.extracted_text = extracted
+        evidence.processing_status = "completed"
+
+        # Index in ChromaDB Vector Store
+        try:
+            from ai_engine.rag.indexer import index_evidence
+            if extracted:
+                index_evidence(
+                    evidence_id=evidence.id,
+                    investigation_id=investigation_id,
+                    filename=filename,
+                    extracted_text=extracted,
+                )
+        except Exception as idx_err:
+            print(f"Vector indexing warning for evidence {evidence.id}: {idx_err}")
+
+    except Exception as exc:
+        evidence.extracted_text = (
+            f"Text extraction failed: {str(exc)}"
+        )
+        evidence.processing_status = "failed"
+
+    db.commit()
+    db.refresh(evidence)
+
+    return evidence
+
+
+@router.delete(
+    "/evidence/{evidence_id}",
+)
 def delete_evidence(
     evidence_id: int,
     db: Session = Depends(get_db),
 ):
-
-    item = (
+    evidence = (
         db.query(Evidence)
-        .filter(
-            Evidence.id == evidence_id
-        )
+        .filter(Evidence.id == evidence_id)
         .first()
     )
 
-    if not item:
-
+    if not evidence:
         raise HTTPException(
             status_code=404,
-            detail="Evidence not found"
+            detail="Evidence not found.",
         )
-
 
     try:
+        if evidence.storage_path:
+            path = Path(evidence.storage_path)
 
-        path = Path(
-            item.storage_path
-            or item.file_path
-            or ""
-        )
+            if path.exists():
+                path.unlink()
 
-        if path.exists():
-            path.unlink()
+    except Exception:
+        pass
 
+    db.delete(evidence)
+    db.commit()
 
-        db.delete(item)
-
-        db.commit()
-
-
-        return {
-
-            "success": True,
-
-            "message":
-                "Evidence deleted successfully",
-
-            "id":
-                evidence_id,
-
-        }
+    return {
+        "success": True,
+        "message": "Evidence deleted.",
+    }
 
 
-    except Exception as error:
+@router.get(
+    "/evidence/{evidence_id}",
+    response_model=EvidenceResponse,
+)
+def get_single_evidence(
+    evidence_id: int,
+    db: Session = Depends(get_db),
+):
+    evidence = (
+        db.query(Evidence)
+        .filter(Evidence.id == evidence_id)
+        .first()
+    )
 
-        db.rollback()
-
+    if not evidence:
         raise HTTPException(
-            status_code=500,
-            detail=str(error)
+            status_code=404,
+            detail="Evidence not found.",
         )
+
+    return evidence
