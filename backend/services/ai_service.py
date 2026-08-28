@@ -1,366 +1,214 @@
 import os
-from typing import Any, Dict, List, Optional
-
+import re
+import json
+from typing import Any, Dict, List
 from dotenv import load_dotenv
-from openai import OpenAI
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 class AIEngineService:
-
     def __init__(self):
-
-        self.api_key = os.getenv("OPENAI_API_KEY")
-
-        # Current OpenAI model name
-        self.model = os.getenv(
-            "OPENAI_MODEL",
-            "gpt-5.6-luna"
-        )
+        self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        model_env = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        
+        # Sanitize non-standard model names
+        if not model_env or "gpt-5" in model_env or "luna" in model_env:
+            self.model = "gpt-4o-mini"
+        else:
+            self.model = model_env
 
         self.client = None
 
         if self.api_key:
-            self.client = OpenAI(
-                api_key=self.api_key
-            )
-
-    # =========================================================
-    # CHECK AI
-    # =========================================================
+            try:
+                from openai import OpenAI
+                self.client = OpenAI(api_key=self.api_key)
+            except Exception as exc:
+                print(f"Warning: Could not initialize OpenAI client: {exc}")
 
     def is_available(self) -> bool:
-        return self.client is not None
-
-    # =========================================================
-    # CHAT
-    # =========================================================
+        return bool(self.client and self.api_key)
 
     def chat(
         self,
         question: str,
         evidence_context: str = "",
-        conversation: Optional[
-            List[Dict[str, str]]
-        ] = None,
+        conversation: List[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
+        """
+        Execute AI forensic chat using OpenAI chat completions API.
+        """
+        system_prompt = """You are AI Digital Investigator, an elite digital forensics & intelligence assistant.
+Your task is to analyze uploaded case evidence, extract facts, identify key entities, construct event timelines, and uncover contradictions or suspicious patterns.
 
-        if not self.client:
+RULES:
+1. Always prioritize exact facts present in the provided EVIDENCE CONTEXT.
+2. Cite specific filenames, line numbers, or section details when quoting facts.
+3. Clearly separate proven facts from logical inferences.
+4. If evidence is insufficient to answer a question, explicitly state what is missing.
+5. Format your answers clearly using markdown headings, bullet points, and code/quote blocks."""
 
-            raise RuntimeError(
-                "OPENAI_API_KEY is missing. "
-                "Add it to your .env file."
-            )
+        user_content = f"### CASE EVIDENCE CONTEXT:\n{evidence_context or 'No specific evidence retrieved.'}\n\n### USER QUESTION:\n{question}"
 
-        question = question.strip()
+        if self.is_available():
+            messages = [{"role": "system", "content": system_prompt}]
+            if conversation:
+                for msg in conversation:
+                    role = msg.get("role", "user")
+                    if role in ["user", "assistant", "system"]:
+                        messages.append({"role": role, "content": msg.get("content", "")})
 
-        if not question:
+            messages.append({"role": "user", "content": user_content})
 
-            raise ValueError(
-                "Question cannot be empty."
-            )
+            # Attempt model call with automatic fallback retry if model name fails
+            for target_model in [self.model, "gpt-4o-mini", "gpt-3.5-turbo"]:
+                try:
+                    response = self.client.chat.completions.create(
+                        model=target_model,
+                        messages=messages,
+                        temperature=0.2,
+                        max_tokens=1500,
+                    )
+                    answer = response.choices[0].message.content
+                    return {
+                        "answer": answer,
+                        "model": target_model,
+                    }
+                except Exception as error:
+                    print(f"OpenAI call with model '{target_model}' failed: {error}")
 
-        conversation = conversation or []
+        # Fallback local forensic summary if API key is missing or failed
+        fallback_answer = self._generate_local_analysis(question, evidence_context)
+        return {
+            "answer": fallback_answer,
+            "model": "Local Forensic Engine (Fallback)",
+        }
 
-        # -----------------------------------------------------
-        # Build conversation history
-        # -----------------------------------------------------
+    def answer(self, question: str, evidence: list[dict]) -> str:
+        """
+        Backwards-compatible wrapper for single query evidence analysis.
+        """
+        evidence_parts = []
+        for item in evidence:
+            filename = item.get("filename", "Unknown")
+            text = item.get("text", "")
+            if text:
+                evidence_parts.append(f"===== EVIDENCE FILE: {filename} =====\n{text[:25000]}\n===== END FILE =====")
 
-        history = ""
+        context = "\n".join(evidence_parts) if evidence_parts else "No readable evidence files."
+        res = self.chat(question, context)
+        return res["answer"]
 
-        for message in conversation[-12:]:
+    def extract_timeline(self, text: str) -> List[Dict[str, str]]:
+        """
+        Extract chronological events, dates, and associated actions from evidence text.
+        """
+        events = []
+        if self.is_available() and text.strip():
+            try:
+                prompt = f"Extract all key dates, timestamps, and chronological events from the following forensic evidence text. Format output as a JSON array of objects with keys 'date', 'event', 'source', 'significance'.\n\nTEXT:\n{text[:10000]}"
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are a JSON date/timeline extractor. Return ONLY valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                )
+                raw_json = response.choices[0].message.content
+                clean_json = re.sub(r"```(?:json)?|```", "", raw_json).strip()
+                parsed = json.loads(clean_json)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception as e:
+                print(f"AI timeline extraction failed: {e}")
 
-            role = message.get(
-                "role",
-                "user"
-            )
-
-            content = message.get(
-                "content",
-                ""
-            )
-
-            if not content:
+        # Fallback regex timeline parser
+        date_patterns = [
+            r"(\b\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?\b)",
+            r"(\b\d{1,2}/\d{1,2}/\d{2,4}\b)",
+            r"(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b)"
+        ]
+        lines = text.split("\n")
+        for index, line in enumerate(lines):
+            line_str = line.strip()
+            if not line_str:
                 continue
-
-            history += (
-                f"\n{role.upper()}: "
-                f"{content}\n"
-            )
-
-        # -----------------------------------------------------
-        # Evidence
-        # -----------------------------------------------------
-
-        if not evidence_context.strip():
-
-            evidence_context = (
-                "No evidence was retrieved for this question."
-            )
-
-        # -----------------------------------------------------
-        # Investigator instructions
-        # -----------------------------------------------------
-
-        instructions = """
-You are AI Digital Investigator.
-
-You are an advanced conversational AI assistant
-specialized in digital investigation and evidence analysis.
-
-Your job is to communicate naturally like a modern AI
-assistant while remaining grounded in the evidence supplied
-by the application.
-
-CORE BEHAVIOR:
-
-- Answer the investigator's actual question.
-- Do not simply return search results.
-- Explain your reasoning clearly.
-- Use evidence whenever it is available.
-- Never invent evidence.
-- Never claim something is proven when the evidence only
-  suggests it.
-- Clearly distinguish:
-  FACT
-  INFERENCE
-  UNKNOWN
-
-INVESTIGATION TASKS:
-
-You can help with:
-
-- Evidence summaries
-- People mentioned in evidence
-- Dates and timelines
-- Locations
-- Organizations
-- Events
-- Relationships between people
-- Suspicious patterns
-- Important clues
-- Contradictions
-- Chronological reconstruction
-- Questions about uploaded documents
-- Comparing pieces of evidence
-- Identifying missing information
-- Suggesting useful investigative follow-up questions
-
-CONVERSATION:
-
-Remember the recent conversation supplied by the application.
-
-If the user says:
-
-"yes"
-"explain that"
-"who is he?"
-"what about the second file?"
-"continue"
-
-use the conversation context to understand what they mean.
-
-STYLE:
-
-Be professional, intelligent and concise.
-
-Use headings and bullet points when useful.
-
-Do not repeatedly say:
-"I am an AI language model."
-
-If there is no evidence, still answer general questions
-normally, but clearly state when the answer is not based
-on investigation evidence.
-
-When discussing evidence, mention filenames when possible.
-
-Never fabricate filenames, people, dates, locations,
-relationships or facts.
-"""
-
-        # -----------------------------------------------------
-        # Prompt
-        # -----------------------------------------------------
-
-        prompt = f"""
-CURRENT EVIDENCE
-================
-
-{evidence_context}
-
-
-RECENT CONVERSATION
-===================
-
-{history}
-
-
-CURRENT INVESTIGATOR QUESTION
-=============================
-
-{question}
-
-
-Now answer the investigator naturally.
-"""
-
-        # -----------------------------------------------------
-        # OpenAI Responses API
-        # -----------------------------------------------------
-
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=prompt,
-        )
-
-        answer = (
-            response.output_text
-            if response.output_text
-            else "I could not generate a response."
-        )
-
-        return {
-            "success": True,
-            "answer": answer.strip(),
-            "model": self.model,
-        }
-
-    # =========================================================
-    # OLD ANALYSIS SUPPORT
-    # =========================================================
-
-    def analyze_text(
-        self,
-        text: str,
-        filename: str = "",
-    ) -> Dict[str, Any]:
-
-        if not text:
-
-            return {
-                "status": "completed",
-                "summary": "No extractable text was found.",
-                "filename": filename,
-                "entities": [],
-                "keywords": [],
-            }
-
-        cleaned = text.strip()
-
-        return {
-            "status": "completed",
-            "summary": self._create_summary(cleaned),
-            "filename": filename,
-            "entities": [],
-            "keywords": self._extract_keywords(cleaned),
-            "text_length": len(cleaned),
-        }
-
-    # =========================================================
-    # SIMPLE SEARCH SUPPORT
-    # =========================================================
-
-    def search(
-        self,
-        query: str,
-        documents: Optional[
-            List[Dict[str, Any]]
-        ] = None,
-    ) -> Dict[str, Any]:
-
-        documents = documents or []
-
-        query_lower = query.lower().strip()
-
-        if not query_lower:
-
-            return {
-                "query": query,
-                "results": [],
-            }
-
-        results = []
-
-        for document in documents:
-
-            text = str(
-                document.get(
-                    "extracted_text"
-                )
-                or document.get(
-                    "text"
-                )
-                or ""
-            )
-
-            if query_lower in text.lower():
-
-                results.append(
-                    document
-                )
-
-        return {
-            "query": query,
-            "results": results,
-        }
-
-    # =========================================================
-    # SUMMARY
-    # =========================================================
-
-    @staticmethod
-    def _create_summary(
-        text: str
-    ) -> str:
-
-        words = text.split()
-
-        if len(words) <= 60:
-            return text
-
-        return (
-            " ".join(words[:60])
-            + "..."
-        )
-
-    # =========================================================
-    # KEYWORDS
-    # =========================================================
-
-    @staticmethod
-    def _extract_keywords(
-        text: str
-    ) -> List[str]:
-
-        words = (
-            text
-            .replace("\n", " ")
-            .split()
-        )
-
-        unique = []
-        seen = set()
-
-        for word in words:
-
-            cleaned = word.strip(
-                ".,!?;:()[]{}\"'`"
-            )
-
-            if len(cleaned) < 4:
-                continue
-
-            key = cleaned.lower()
-
-            if key not in seen:
-
-                seen.add(key)
-                unique.append(cleaned)
-
-            if len(unique) >= 15:
+            for pat in date_patterns:
+                match = re.search(pat, line_str, re.IGNORECASE)
+                if match:
+                    events.append({
+                        "date": match.group(1),
+                        "event": line_str,
+                        "source": f"Line {index+1}",
+                        "significance": "Automated log timestamp detection"
+                    })
+                    break
+            if len(events) >= 15:
                 break
 
-        return unique
+        return events
+
+    def extract_entities(self, text: str) -> Dict[str, List[str]]:
+        """
+        Extract named entities: People, Organizations, IP Addresses, Emails, Dates.
+        """
+        entities = {
+            "people": [],
+            "organizations": [],
+            "ips": [],
+            "emails": [],
+            "dates": []
+        }
+
+        # Regex extractions
+        ip_pattern = r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"
+        email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+
+        entities["ips"] = list(set(re.findall(ip_pattern, text)))
+        entities["emails"] = list(set(re.findall(email_pattern, text)))
+
+        if self.is_available() and text.strip():
+            try:
+                prompt = f"Extract key entities from this forensic evidence text. Return JSON with keys 'people', 'organizations', 'dates'.\n\nTEXT:\n{text[:8000]}"
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are a JSON entity extractor. Return ONLY valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                )
+                raw_json = response.choices[0].message.content
+                clean_json = re.sub(r"```(?:json)?|```", "", raw_json).strip()
+                ai_extracted = json.loads(clean_json)
+                if isinstance(ai_extracted, dict):
+                    entities["people"] = ai_extracted.get("people", [])
+                    entities["organizations"] = ai_extracted.get("organizations", [])
+                    entities["dates"] = ai_extracted.get("dates", [])
+            except Exception as e:
+                print(f"AI entity extraction failed: {e}")
+
+        return entities
+
+    def _generate_local_analysis(self, question: str, context: str) -> str:
+        if not context or "No matching evidence" in context or "No readable evidence" in context:
+            return (
+                "### Forensic Intelligence Summary\n\n"
+                "**Status:** No specific evidence chunks match your prompt.\n\n"
+                "**Recommendation:** Upload evidence documents (.pdf, .txt, .docx, .log) to this investigation case."
+            )
+
+        return (
+            "### Forensic Intelligence Summary (Vector Analysis)\n\n"
+            f"**Query Analyzed:** `{question}`\n\n"
+            "**Key Findings from Case Evidence:**\n"
+            f"{context[:1500]}\n"
+        )
+
+
+# Export standard service instances and backwards compatible class names
+ai_service = AIEngineService()
+ai_investigator = ai_service
+AIInvestigator = AIEngineService
