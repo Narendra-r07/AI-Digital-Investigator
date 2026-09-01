@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
@@ -21,13 +21,16 @@ if DATABASE_URL.startswith("sqlite"):
     )
 else:
     try:
-        engine = create_engine(
+        temp_engine = create_engine(
             DATABASE_URL,
             pool_pre_ping=True,
             future=True,
         )
+        with temp_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine = temp_engine
     except Exception as exc:
-        print(f"PostgreSQL connection failed ({exc}), falling back to SQLite.")
+        print(f"Database connection to {DATABASE_URL} failed ({exc}), falling back to SQLite.")
         engine = create_engine(
             DEFAULT_SQLITE_URL,
             connect_args={"check_same_thread": False},
