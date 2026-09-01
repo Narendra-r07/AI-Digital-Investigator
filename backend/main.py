@@ -12,6 +12,8 @@ from backend.routers import evidence
 from backend.routers import investigations
 
 
+
+
 # ---------------------------------------------------------
 # APPLICATION
 # ---------------------------------------------------------
@@ -29,27 +31,17 @@ app = FastAPI(
 # CORS
 # ---------------------------------------------------------
 
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
+cors_env = os.getenv("CORS_ORIGINS", "*").strip()
+if cors_env == "*" or not cors_env:
+    allowed_origins = ["*"]
+    allow_credentials = False
+else:
+    allowed_origins = [origin.strip() for origin in cors_env.split(",") if origin.strip()]
+    allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------
-# STORAGE
-# ---------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
