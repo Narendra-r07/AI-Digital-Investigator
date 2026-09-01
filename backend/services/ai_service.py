@@ -9,23 +9,43 @@ load_dotenv(override=True)
 
 class AIEngineService:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model_env = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         
-        # Sanitize non-standard model names
-        if not model_env or "gpt-5" in model_env or "luna" in model_env:
-            self.model = "gpt-4o-mini"
+        self.api_key = groq_key or openai_key
+        self.is_groq = self.api_key.startswith("gsk_") or bool(groq_key)
+
+        if self.is_groq:
+            default_model = "groq/compound-mini"
+            model_env = os.getenv("GROQ_MODEL", os.getenv("OPENAI_MODEL", default_model)).strip()
+            self.model = model_env if model_env else default_model
+            self.base_url = "https://api.groq.com/openai/v1"
+            self.fallback_models = [
+                self.model,
+                "groq/compound-mini",
+                "groq/compound",
+                "qwen/qwen3.8-27b",
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b"
+            ]
         else:
-            self.model = model_env
+            default_model = "gpt-4o-mini"
+            model_env = os.getenv("OPENAI_MODEL", default_model).strip()
+            self.model = model_env if model_env and "gpt" in model_env else default_model
+            self.base_url = None
+            self.fallback_models = [self.model, "gpt-4o-mini", "gpt-3.5-turbo"]
 
         self.client = None
 
         if self.api_key:
             try:
                 from openai import OpenAI
-                self.client = OpenAI(api_key=self.api_key)
+                kwargs = {"api_key": self.api_key}
+                if self.base_url:
+                    kwargs["base_url"] = self.base_url
+                self.client = OpenAI(**kwargs)
             except Exception as exc:
-                print(f"Warning: Could not initialize OpenAI client: {exc}")
+                print(f"Warning: Could not initialize AI client: {exc}")
 
     def is_available(self) -> bool:
         return bool(self.client and self.api_key)
@@ -37,7 +57,7 @@ class AIEngineService:
         conversation: List[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
-        Execute AI forensic chat using OpenAI chat completions API.
+        Execute AI forensic chat using OpenAI/Groq chat completions API.
         """
         system_prompt = """You are AI Digital Investigator, an elite digital forensics & intelligence assistant.
 Your task is to analyze uploaded case evidence, extract facts, identify key entities, construct event timelines, and uncover contradictions or suspicious patterns.
@@ -61,8 +81,8 @@ RULES:
 
             messages.append({"role": "user", "content": user_content})
 
-            # Attempt model call with automatic fallback retry if model name fails
-            for target_model in [self.model, "gpt-4o-mini", "gpt-3.5-turbo"]:
+            # Attempt model call with automatic fallback retry if model fails
+            for target_model in self.fallback_models:
                 try:
                     response = self.client.chat.completions.create(
                         model=target_model,
@@ -76,7 +96,7 @@ RULES:
                         "model": target_model,
                     }
                 except Exception as error:
-                    print(f"OpenAI call with model '{target_model}' failed: {error}")
+                    print(f"AI call with model '{target_model}' failed: {error}")
 
         # Fallback local forensic summary if API key is missing or failed
         fallback_answer = self._generate_local_analysis(question, evidence_context)
